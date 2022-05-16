@@ -98,4 +98,22 @@ def img_split(args, x, y):
 
     return [x_piece1, x_piece2, x_piece3, x_piece4], np.array(y_split)
 
+def img_split_3piece(args, x, y):
+    x_piece1 = []
+    x_piece2 = []
+    x_piece3 = []
+    
+    y_split = []
+    inputsize = int(args.inputsize / 2)
+    for i in range(len(x)):
+        img = x[i]
+
+        x_piece1.append(img[0:inputsize, :].flatten())
+        x_piece2.append(img[inputsize:, 0:inputsize:].flatten())
+        x_piece3.append(img[inputsize:, inputsize:].flatten())
+        # y_split.append(onehot(y[i]))
+        y_split.append(y[i])
+
+    return [x_piece1, x_piece2, x_piece3], np.array(y_split)
+
 

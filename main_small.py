@@ -10,20 +10,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 from util import init_log_cent, dump_circuit
 from data_helper import load_raw_data, split_train_validation
+from results_analy_small import plot_performance, plot_var_grad
 # from callbackfunc import EvalModel_single, GetGradients
 
 
 def args_parser():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--task', type=str, default='tfq_single_test', help='task name')
+    parser.add_argument('--task', type=str, default='small_6gates_4bits', help='task name')
     parser.add_argument('--dataset', type=str, default='mnist', help="name of dataset")
     parser.add_argument('--seed', type=int, default=1, help='random seed')
-    parser.add_argument('--inputsize', type=int, default=4, help='the input size is nxn')
+    parser.add_argument('--inputsize', type=int, default=2, help='the input size is nxn')
 
     parser.add_argument('--lr', type=float, default=0.1, help='learning rate')
     parser.add_argument('--epoch', type=int, default=100, help="the number of epochs in each global round")
-    parser.add_argument('--batchsize', type=int, default=16, help="local batch size")
+    parser.add_argument('--batchsize', type=int, default=32, help="local batch size")
     parser.add_argument('--validation_ratio', type=float, default=0.2, help='the ratio of validation dataset')
 
     args = parser.parse_args()
@@ -70,6 +71,9 @@ def create_quantum_model(inputsize):
     builder.add_layer(circuit, cirq.XX, "xx1")
     builder.add_layer(circuit, cirq.YY, "yy1")
     builder.add_layer(circuit, cirq.ZZ, "zz1")
+    builder.add_layer(circuit, cirq.XX, "xx2")
+    builder.add_layer(circuit, cirq.YY, "yy2")
+    builder.add_layer(circuit, cirq.ZZ, "zz2")
 
     # Finally, prepare the readout qubit.
     circuit.append(cirq.H(readout))
@@ -87,6 +91,7 @@ def main():
 
     all_gradients = []
     all_params = []
+    var_gradients = []
 
     x_train, y_train, x_test, y_test = load_raw_data(args)
     x_train, y_train, x_val, y_val = split_train_validation(x_train, y_train, args.validation_ratio)
@@ -162,19 +167,23 @@ def main():
             acc = 100 * correct_num / args.batchsize
             batchloss = batchloss / args.batchsize
 
-            # if iter % 10 == 0:
+            
 
             print('Epoch {}, Iteration {}/{}: Loss: {}, Accuracy: {}'.format(epoch, 
                             iter, iterations, batchloss, acc))
 
+            batch_gradients = tf.squeeze(tf.stack(batch_gradients))
+            var_gradients.append(tf.math.reduce_std(batch_gradients, 0).numpy())
+
             batch_gradients0 = tf.math.reduce_mean(batch_gradients, 0)
-            optimizer.apply_gradients(zip(batch_gradients0, modelqlayer.trainable_variables))
+            optimizer.apply_gradients(zip([batch_gradients0], modelqlayer.trainable_variables))
 
             all_gradients.append(batch_gradients0.numpy())
             all_params.append(modelqlayer.trainable_variables[0].numpy())
 
             np.save(save_path + '/gradients_layer.npy', np.array(all_gradients))
             np.save(save_path + '/all_models.npy', np.array(all_params))
+            np.save(save_path + '/var_gradients.npy', np.array(var_gradients))
 
             sheet.write(int(epoch * int(iterations) + iter + 1), 2, acc)
             sheet.write(int(epoch * int(iterations) + iter + 1), 3, float(batchloss.numpy()))
@@ -202,7 +211,7 @@ def main():
 
             if tf.math.sign(y_pred) == np.sign(y):
                 correct_val += 1
-        acc_val = correct_val / len(y_val)
+        acc_val = 100 * correct_val / len(y_val)
         loss_val = loss_val / len(y_val)
         
         print('Epoch {}, Validation: Loss: {}, Accuracy: {}'.format(epoch, 
@@ -235,7 +244,7 @@ def main():
 
             if tf.math.sign(y_pred) == np.sign(y):
                 correct_test += 1
-        acc_test = correct_test / len(y_test)
+        acc_test = 100 * correct_test / len(y_test)
         loss_test = loss_test / len(y_test)
         
         print('Epoch {}, Testing: Loss: {}, Accuracy: {}'.format(epoch, 
@@ -255,4 +264,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+    save_path = './scale_qml/save_small/' + args.task
+    plot_performance(save_path, args.task)
+    plot_var_grad(save_path, args)
     

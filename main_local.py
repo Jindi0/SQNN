@@ -5,7 +5,6 @@ import cirq
 import sympy
 import tensorflow as tf
 import tensorflow_quantum as tfq
-# from sklearn.utils import shuffle
 import numpy as np
 import matplotlib.pyplot as plt
 from util import init_log_cent, dump_circuit
@@ -17,17 +16,20 @@ from results_analy_large import plot_performance, plot_var_grad
 def args_parser():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--task', type=str, default='large_xyz_y_4bits', help='task name')
+    parser.add_argument('--task', type=str, default='local_xyz_y_4bit', help='task name')
     parser.add_argument('--dataset', type=str, default='mnist', help="name of dataset")
     parser.add_argument('--seed', type=int, default=1, help='random seed')
     parser.add_argument('--inputsize', type=int, default=4, help='the input size is nxn')
     parser.add_argument('--clfinputsize', type=int, default=2, help='the input size is nxn')
     parser.add_argument('--pieces', type=int, default=4, help='the input size is nxn')
+    parser.add_argument('--localepoch', type=int, default=3, help='the input size is nxn')
+    parser.add_argument('--globalepoch', type=int, default=30, help='the input size is nxn')
+
     # parser.add_argument('--layers', type=int, default=2, help='the input size is nxn')
 
 
     parser.add_argument('--lr', type=float, default=0.1, help='learning rate')
-    parser.add_argument('--epoch', type=int, default=100, help="the number of epochs in each global round")
+    # parser.add_argument('--epoch', type=int, default=100, help="the number of epochs in each global round")
     parser.add_argument('--batchsize', type=int, default=32, help="local batch size")
     parser.add_argument('--validation_ratio', type=float, default=0.2, help='the ratio of validation dataset')
 
@@ -115,7 +117,7 @@ def create_quantum_model(inputsize, piece_ind):
 def main():
     f, sheet = init_log_cent(args)
 
-    save_path = './scale_qml/save_large/' + args.task
+    save_path = './scale_qml/save_local/' + args.task
     if not os.path.exists(save_path):
         os.mkdir(save_path)
 
@@ -147,7 +149,7 @@ def main():
     clf_layer = tfq.layers.PQC(clf_circuit, clf_readout, 
                 initializer=tf.keras.initializers.RandomUniform(0, 2 * np.pi, seed=args.seed))
 
-    dump_circuit(model_circuit, dest_path='./scale_qml/save_large/{}/{}.svg'.format(args.task, args.task))
+    dump_circuit(model_circuit, dest_path='./scale_qml/save_local/{}/{}.svg'.format(args.task, args.task))
     input_qubits = tfq.convert_to_tensor([cirq.Circuit()])
     
     optimizer = tf.keras.optimizers.SGD(lr=args.lr)
@@ -162,8 +164,87 @@ def main():
     x_train_pieces = [x[:num_data] for x in x_train_pieces]
     y_train = y_train[:num_data]
 
+    for gepoch in range(args.globalepoch):
+        # x_train_pieces, y_train = shuffle_dataset(x_train_pieces, y_train)
 
-    for epoch in range(args.epoch):
+        # local training 
+        for epoch in range(args.localepoch):
+            x_train_pieces, y_train = shuffle_dataset(x_train_pieces, y_train)
+
+            for iter in range(iterations):
+                x_batch = [x_train[iter*args.batchsize: (iter+1)*args.batchsize] for x_train in x_train_pieces]
+                y_batch = y_train[iter*args.batchsize: (iter+1)*args.batchsize]
+
+                local_batchloss = [0.0, 0.0, 0.0, 0.0]
+                correct_num = [0, 0, 0, 0]
+                batch_gradients_layer = []
+
+            
+                ori_weights = [ql.get_weights()[0] for ql in quantum_layers]
+                model_weights = [ow[int(args.inputsize / 2) ** 2:] for ow in ori_weights]
+
+                for b in range(args.batchsize):
+                    x = [x_b[b] for x_b in x_batch]
+                    y = y_batch[b]
+                    y = 2.0 * y - 1.0
+
+                    for cur_piece in range(args.pieces):
+                        new_weight = np.concatenate((x[cur_piece].flatten(), model_weights[cur_piece]))
+                        quantum_layers[cur_piece].set_weights([new_weight])
+
+                    # ============================================= 
+                    @tf.function()
+                    def forward_local():
+                        # quantum layer
+                        with tf.GradientTape(persistent=True) as tape:
+                            outs = []
+                            localloss = []
+                            for cur_piece in range(args.pieces):
+                                out = quantum_layers[cur_piece](input_qubits)
+                                outs.append(out)
+                                localloss.append(((out - y) ** 2) / 2)
+
+                        dlocalloss_dtheta = []
+                        for cur_piece in range(args.pieces):
+                            cur_grad = tape.gradient(localloss[cur_piece], quantum_layers[cur_piece].trainable_variables)
+                            dlocalloss_dtheta.append(cur_grad)
+
+                        del tape
+                        return outs, localloss, dlocalloss_dtheta
+                    # ============================================= 
+
+                    local_outs, local_loss, dlocalloss_dtheta = forward_local()
+                    for cur_piece in range(args.pieces):
+                        local_batchloss[cur_piece] += local_loss[cur_piece].numpy()[0]
+                        if tf.math.sign(local_outs[cur_piece]) == np.sign(y):
+                            correct_num[cur_piece] += 1
+
+                        batch_gradients_layer.append(dlocalloss_dtheta)
+
+                accs = [0.0, 0.0, 0.0, 0.0]
+                tmp_batchloss = [0.0, 0.0, 0.0, 0.0]
+                for cur_piece in range(args.pieces):
+                    accs[cur_piece] = 100 * correct_num[cur_piece] / args.batchsize
+                    tmp_batchloss[cur_piece] = local_batchloss[cur_piece][0] / args.batchsize
+
+                print('Epoch {}-{}, Iteration {}/{}: (Accuracy, Loss): ({}%, {:.2f}), ({}%, {:.2f}), ({}%, {:.2f}), ({}%, {:.2f})'.format(
+                    gepoch, epoch, iter, iterations, 
+                    accs[0], tmp_batchloss[0], accs[1], tmp_batchloss[1], 
+                    accs[2], tmp_batchloss[2], accs[3], tmp_batchloss[3])) 
+
+                batch_gradients_layer0 = tf.squeeze(tf.math.reduce_mean(batch_gradients_layer, 0))
+                for cur in range(args.pieces):
+                    tmp = [batch_gradients_layer0[cur]]
+                    tmp1 = quantum_layers[cur].trainable_variables
+                    optimizer.apply_gradients(zip(tmp, tmp1))
+
+                    sheet.write(int(epoch * int(iterations) + iter + 1), 2 + 2*cur, accs[cur])
+                    sheet.write(int(epoch * int(iterations) + iter + 1), 3 + 2*cur, tmp_batchloss[cur])
+                f.save(save_path + '/{}.xls'.format(args.task))
+
+        # ---------------------------------------
+
+        # global training
         x_train_pieces, y_train = shuffle_dataset(x_train_pieces, y_train)
 
         for iter in range(iterations):
@@ -171,17 +252,17 @@ def main():
             y_batch = y_train[iter*args.batchsize: (iter+1)*args.batchsize]
 
             batchloss = 0.0
-            batch_gradients_layer = []
+            # batch_gradients_layer = []
             batch_gradients_clf = []
 
-            correct_num = 0
+            correct_num_clf = 0
 
             ori_weights = [ql.get_weights()[0] for ql in quantum_layers]
             model_weights = [ow[int(args.inputsize / 2) ** 2:] for ow in ori_weights]
 
             ori_clf_weight = clf_layer.get_weights()[0]
             clf_weight =ori_clf_weight[args.clfinputsize * args.clfinputsize:]
-
+                
 
             for b in range(args.batchsize):
                 x = [x_b[b] for x_b in x_batch]
@@ -192,11 +273,9 @@ def main():
                     new_weight = np.concatenate((x[cur_piece].flatten(), model_weights[cur_piece]))
                     quantum_layers[cur_piece].set_weights([new_weight])
 
-
                 # ============================================= 
                 @tf.function()
-                def forward():
-                    # quantum layer
+                def forward_clf():
                     with tf.GradientTape(persistent=True) as tape:
                         outs = []
                         for cur_piece in range(args.pieces):
@@ -206,85 +285,42 @@ def main():
                         # set clf parameters
                         outs2input = [o.numpy()[0][0] for o in outs]
                         outs2input = np.array(outs2input)
-
                         outs2input = np.pi * (outs2input + 1)
 
                         new_clf_weight = np.concatenate([outs2input, clf_weight])
                         clf_layer.set_weights([new_clf_weight])
 
                         final_out = clf_layer(input_qubits)
- 
                         mse_loss = ((final_out - y) ** 2) / 2
-
                     dloss_dtheta_clf = tape.gradient(mse_loss, clf_layer.trainable_variables)
-                    dout_dtheta = []
-                    for cur_piece in range(args.pieces):
-                        cur_grad = tape.gradient(outs[cur_piece], quantum_layers[cur_piece].trainable_variables)
-                        dout_dtheta.append(cur_grad)
-
                     del tape
-
-                    return final_out, mse_loss, dout_dtheta, dloss_dtheta_clf
+                    return final_out, mse_loss, dloss_dtheta_clf
                 # ============================================= 
-                
-                y_pred, loss, dout_dtheta, dloss_dtheta_clf = forward()
+                y_pred, loss, dloss_dtheta_clf = forward_clf()
                 batchloss += loss
                 if tf.math.sign(y_pred) == np.sign(y):
-                    correct_num += 1
+                    correct_num_clf += 1
+                batch_gradients_clf.append(dloss_dtheta_clf)
+            acc = 100 * correct_num_clf / args.batchsize
+            batchloss = batchloss[0]  / args.batchsize
+            print('Epoch {}, Iteration {}/{}: Accuracy: {}, Loss: {}'.format(gepoch, 
+                            iter, iterations, acc, batchloss))
 
-                if dloss_dtheta_clf != None:
-                    dloss_dout = dloss_dtheta_clf[0][0:4]
-                    dloss_dtheta_layer = []
-                    for cur in range(args.pieces):
-                        dloss_dtheta_layer_ = dloss_dout[cur] * dout_dtheta[cur] * np.pi
-                        dloss_dtheta_layer.append(dloss_dtheta_layer_)
-                    
-                    batch_gradients_layer.append(dloss_dtheta_layer)
-                    batch_gradients_clf.append(dloss_dtheta_clf)
-
-            acc = 100 * correct_num / args.batchsize
-            batchloss = batchloss / args.batchsize
-
-            print('Epoch {}, Iteration {}/{}: Loss: {}, Accuracy: {}'.format(epoch, 
-                            iter, iterations, batchloss, acc))
-
-            batch_gradients_pieces = tf.squeeze(tf.stack(batch_gradients_layer))
-            batch_gradients_pieces = tf.transpose(batch_gradients_pieces, perm=[1, 0, 2])
-
-            var_gradients_pieces = [tf.math.reduce_std(g, 0).numpy() for g in batch_gradients_pieces]
-            var_gradients_layers.append(var_gradients_pieces)
-
-            batch_gradients_clf_tmp = tf.squeeze(tf.stack(batch_gradients_clf))
-            var_gradients_clf.append(tf.math.reduce_std(batch_gradients_clf_tmp, 0).numpy())
-
-            
-       
-            batch_gradients_layer0 = tf.squeeze(tf.math.reduce_mean(batch_gradients_layer, 0))
             batch_gradients_clf0 = tf.math.reduce_mean(batch_gradients_clf, 0)
-
             optimizer.apply_gradients(zip(batch_gradients_clf0, clf_layer.trainable_variables))
-            for cur in range(args.pieces):
-                tmp = [batch_gradients_layer0[cur]]
-                tmp1 = quantum_layers[cur].trainable_variables
-                optimizer.apply_gradients(zip(tmp, tmp1))
             
-
-            all_gradients_layer.append(batch_gradients_layer0.numpy())
-            all_gradients_clf.append(batch_gradients_clf0.numpy())
-            all_param_layer.append([ql.get_weights()[0][:int(args.inputsize / 2) ** 2] for ql in quantum_layers])
-            all_param_clf.append(clf_layer.trainable_variables[0].numpy())
-
-            np.save(save_path + '/gradients_layer.npy', np.array(all_gradients_layer))
-            np.save(save_path + '/gradients_clf.npy', np.array(all_gradients_clf))
-            np.save(save_path + '/all_models_layer.npy', np.array(all_param_layer))
-            np.save(save_path + '/all_models_clf.npy', np.array(all_param_clf))
-            np.save(save_path + '/var_gradients_layer.npy', np.array(var_gradients_layers))
-            np.save(save_path + '/var_gradients_clf.npy', np.array(var_gradients_clf))
-
-            sheet.write(int(epoch * int(iterations) + iter + 1), 2, acc)
-            sheet.write(int(epoch * int(iterations) + iter + 1), 3, float(batchloss.numpy()))
+            sheet.write(int(gepoch * int(iterations) + iter + 1), 12, acc)
+            sheet.write(int(gepoch * int(iterations) + iter + 1), 13, float(batchloss.numpy()))
             f.save(save_path + '/{}.xls'.format(args.task))
-                
+
+
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
         # validation ---------------------------------------------
         
 
@@ -341,11 +377,11 @@ def main():
         acc_val = 100 * correct_val / len(y_val)
         loss_val = loss_val / len(y_val)
         
-        print('Epoch {}, Validation: Loss: {}, Accuracy: {}'.format(epoch, 
+        print('Epoch {}, Validation: Loss: {}, Accuracy: {}'.format(gepoch, 
                             loss_val, acc_val))
 
-        sheet.write(int(epoch + 1), 5, acc_val)
-        sheet.write(int(epoch + 1), 6, float(loss_val.numpy()))
+        sheet.write(int(epoch + 1), 15, acc_val)
+        sheet.write(int(epoch + 1), 16, float(loss_val.numpy()))
         f.save(save_path + '/{}.xls'.format(args.task))
 
     
@@ -380,11 +416,11 @@ def main():
         acc_test = 100 * correct_test / len(y_test)
         loss_test = loss_test / len(y_test)
         
-        print('Epoch {}, Testing: Loss: {}, Accuracy: {}'.format(epoch, 
+        print('Epoch {}, Testing: Loss: {}, Accuracy: {}'.format(gepoch, 
                             loss_test, acc_test))
 
-        sheet.write(int(epoch + 1), 8, acc_test)
-        sheet.write(int(epoch + 1), 9, float(loss_test.numpy()))
+        sheet.write(int(epoch + 1), 18, acc_test)
+        sheet.write(int(epoch + 1), 19, float(loss_test.numpy()))
         f.save(save_path + '/{}.xls'.format(args.task))
 
         
@@ -399,7 +435,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-    save_path = './scale_qml/save_large/' + args.task
+    save_path = './scale_qml/save_local/' + args.task
     plot_performance(save_path, args.task)
     plot_var_grad(save_path, int((args.inputsize / 2) ** 2), args.pieces)
     

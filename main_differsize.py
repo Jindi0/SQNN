@@ -9,20 +9,24 @@ import tensorflow_quantum as tfq
 import numpy as np
 import matplotlib.pyplot as plt
 from util import init_log_cent, dump_circuit
-from data_helper import load_raw_data, split_train_validation, shuffle_dataset, img_split
+from data_helper import load_raw_data, split_train_validation, img_split_3piece
 # from callbackfunc import EvalModel_single, GetGradients
 from results_analy_large import plot_performance, plot_var_grad
+from sklearn.utils import shuffle
 
 
 def args_parser():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--task', type=str, default='large_xyz_y_4bits', help='task name')
+    parser.add_argument('--task', type=str, default='differ_xyz_y_4bits', help='task name')
     parser.add_argument('--dataset', type=str, default='mnist', help="name of dataset")
     parser.add_argument('--seed', type=int, default=1, help='random seed')
     parser.add_argument('--inputsize', type=int, default=4, help='the input size is nxn')
-    parser.add_argument('--clfinputsize', type=int, default=2, help='the input size is nxn')
-    parser.add_argument('--pieces', type=int, default=4, help='the input size is nxn')
+    parser.add_argument('--clfinputsize', type=int, default=3, help='the input size is nxn')
+    parser.add_argument('--pieces', type=int, default=3, help='the input size is nxn')
+    # parser.add_argument('--piece1size', type=int, default=8, help='the input size is nxn')
+    # parser.add_argument('--piece2size', type=int, default=4, help='the input size is nxn')
+    # parser.add_argument('--piece3size', type=int, default=4, help='the input size is nxn')
     # parser.add_argument('--layers', type=int, default=2, help='the input size is nxn')
 
 
@@ -58,7 +62,7 @@ class CircuitLayerBuilder():
 
 def create_clf_model(inputsize, piece_ind):
 
-    data_qubits = cirq.GridQubit.rect(inputsize, inputsize)  # a 4x4 grid.
+    data_qubits = cirq.GridQubit.rect(1, inputsize)  # a 4x4 grid.
     readout = cirq.GridQubit(-1, -1)         # a single qubit at [-1,-1]
     circuit = cirq.Circuit()
 
@@ -82,9 +86,9 @@ def create_clf_model(inputsize, piece_ind):
     return circuit, cirq.Z(readout)
 
 
-def create_quantum_model(inputsize, piece_ind):
+def create_quantum_model(piecesize, piece_ind):
     """Create a QNN model circuit and readout operation to go along with it."""
-    data_qubits = cirq.GridQubit.rect(inputsize, inputsize)  # a 4x4 grid.
+    data_qubits = cirq.GridQubit.rect(1, piecesize)  # a 4x4 grid.
     readout = cirq.GridQubit(-1, -1)         # a single qubit at [-1,-1]
     circuit = cirq.Circuit()
 
@@ -107,15 +111,18 @@ def create_quantum_model(inputsize, piece_ind):
 
     return circuit, cirq.Z(readout)
 
-
+def shuffle_dataset(x, y):
+    x0, x1, x2, y = shuffle(x[0], x[1], x[2], y)
+    return [x0, x1, x2], y
 
 
 
 
 def main():
+    piecesizes = [8, 4, 4]
     f, sheet = init_log_cent(args)
 
-    save_path = './scale_qml/save_large/' + args.task
+    save_path = './scale_qml/save_differsize/' + args.task
     if not os.path.exists(save_path):
         os.mkdir(save_path)
 
@@ -130,15 +137,15 @@ def main():
     x_train, y_train, x_val, y_val = split_train_validation(x_train, y_train, args.validation_ratio)
 
     # split data into pieces 
-    x_train_pieces, y_train = img_split(args, x_train, y_train)
-    x_val_pieces, y_val = img_split(args, x_val, y_val)
-    x_test_pieces, y_test = img_split(args, x_test, y_test)
+    x_train_pieces, y_train = img_split_3piece(args, x_train, y_train)
+    x_val_pieces, y_val = img_split_3piece(args, x_val, y_val)
+    x_test_pieces, y_test = img_split_3piece(args, x_test, y_test)
 
 
     quantum_layers = []
 
     for i in range(args.pieces):
-        model_circuit, model_readout = create_quantum_model(int(args.inputsize/2), i)
+        model_circuit, model_readout = create_quantum_model(piecesizes[i], i)
         qlayer = tfq.layers.PQC(model_circuit, model_readout, 
                     initializer=tf.keras.initializers.RandomUniform(0, 2 * np.pi, seed=args.seed))
         quantum_layers.append(qlayer)
@@ -147,7 +154,7 @@ def main():
     clf_layer = tfq.layers.PQC(clf_circuit, clf_readout, 
                 initializer=tf.keras.initializers.RandomUniform(0, 2 * np.pi, seed=args.seed))
 
-    dump_circuit(model_circuit, dest_path='./scale_qml/save_large/{}/{}.svg'.format(args.task, args.task))
+    dump_circuit(model_circuit, dest_path='./scale_qml/save_differsize/{}/{}.svg'.format(args.task, args.task))
     input_qubits = tfq.convert_to_tensor([cirq.Circuit()])
     
     optimizer = tf.keras.optimizers.SGD(lr=args.lr)
@@ -177,10 +184,11 @@ def main():
             correct_num = 0
 
             ori_weights = [ql.get_weights()[0] for ql in quantum_layers]
-            model_weights = [ow[int(args.inputsize / 2) ** 2:] for ow in ori_weights]
+            model_weights = [ori_weights[i][piecesizes[i]:] for i in range(args.pieces)]
+            # model_weights = [ori_weights[0][]]
 
             ori_clf_weight = clf_layer.get_weights()[0]
-            clf_weight =ori_clf_weight[args.clfinputsize * args.clfinputsize:]
+            clf_weight =ori_clf_weight[args.pieces:]
 
 
             for b in range(args.batchsize):
@@ -233,7 +241,7 @@ def main():
                     correct_num += 1
 
                 if dloss_dtheta_clf != None:
-                    dloss_dout = dloss_dtheta_clf[0][0:4]
+                    dloss_dout = dloss_dtheta_clf[0][0:args.pieces]
                     dloss_dtheta_layer = []
                     for cur in range(args.pieces):
                         dloss_dtheta_layer_ = dloss_dout[cur] * dout_dtheta[cur] * np.pi
@@ -248,18 +256,32 @@ def main():
             print('Epoch {}, Iteration {}/{}: Loss: {}, Accuracy: {}'.format(epoch, 
                             iter, iterations, batchloss, acc))
 
-            batch_gradients_pieces = tf.squeeze(tf.stack(batch_gradients_layer))
-            batch_gradients_pieces = tf.transpose(batch_gradients_pieces, perm=[1, 0, 2])
+            # batch_gradients_pieces = tf.squeeze(tf.stack(batch_gradients_layer))
+            # batch_gradients_pieces = tf.transpose(batch_gradients_pieces, perm=[1, 0, 2])
 
-            var_gradients_pieces = [tf.math.reduce_std(g, 0).numpy() for g in batch_gradients_pieces]
-            var_gradients_layers.append(var_gradients_pieces)
+            # var_gradients_pieces = [tf.math.reduce_std(g, 0).numpy() for g in batch_gradients_pieces]
+            # var_gradients_layers.append(var_gradients_pieces)
 
-            batch_gradients_clf_tmp = tf.squeeze(tf.stack(batch_gradients_clf))
-            var_gradients_clf.append(tf.math.reduce_std(batch_gradients_clf_tmp, 0).numpy())
+            # batch_gradients_clf_tmp = tf.squeeze(tf.stack(batch_gradients_clf))
+            # var_gradients_clf.append(tf.math.reduce_std(batch_gradients_clf_tmp, 0).numpy())
 
+
+            batch_gradients_layer_1 = []
+            batch_gradients_layer_2 = []
+            batch_gradients_layer_3 = []
             
-       
-            batch_gradients_layer0 = tf.squeeze(tf.math.reduce_mean(batch_gradients_layer, 0))
+
+            for j in range(args.batchsize):
+                batch_gradients_layer_1.append(batch_gradients_layer[j][0])
+                batch_gradients_layer_2.append(batch_gradients_layer[j][1])
+                batch_gradients_layer_3.append(batch_gradients_layer[j][2])
+
+            batch_gradients_layer_1 = tf.squeeze(tf.math.reduce_mean(batch_gradients_layer_1, 0))
+            batch_gradients_layer_2 = tf.squeeze(tf.math.reduce_mean(batch_gradients_layer_2, 0))
+            batch_gradients_layer_3 = tf.squeeze(tf.math.reduce_mean(batch_gradients_layer_3, 0))
+            batch_gradients_layer0 = [batch_gradients_layer_1, batch_gradients_layer_2, batch_gradients_layer_3]
+
+            # batch_gradients_layer0 = tf.squeeze(tf.math.reduce_mean(batch_gradients_layer, 0))
             batch_gradients_clf0 = tf.math.reduce_mean(batch_gradients_clf, 0)
 
             optimizer.apply_gradients(zip(batch_gradients_clf0, clf_layer.trainable_variables))
@@ -269,7 +291,7 @@ def main():
                 optimizer.apply_gradients(zip(tmp, tmp1))
             
 
-            all_gradients_layer.append(batch_gradients_layer0.numpy())
+            all_gradients_layer.append(batch_gradients_layer0)
             all_gradients_clf.append(batch_gradients_clf0.numpy())
             all_param_layer.append([ql.get_weights()[0][:int(args.inputsize / 2) ** 2] for ql in quantum_layers])
             all_param_clf.append(clf_layer.trainable_variables[0].numpy())
@@ -288,8 +310,12 @@ def main():
         # validation ---------------------------------------------
         
 
+        # ori_weights = [ql.get_weights()[0] for ql in quantum_layers]
+        # model_weights = [ow[int(args.inputsize / 2) ** 2:] for ow in ori_weights]
+
         ori_weights = [ql.get_weights()[0] for ql in quantum_layers]
-        model_weights = [ow[int(args.inputsize / 2) ** 2:] for ow in ori_weights]
+        model_weights = [ori_weights[i][piecesizes[i]:] for i in range(args.pieces)]
+        # model_weights = [ori_weights[0][]]
 
         ori_clf_weight = clf_layer.get_weights()[0]
         clf_weight =ori_clf_weight[args.pieces:]
@@ -305,6 +331,8 @@ def main():
             for cur_piece in range(args.pieces):
                 new_weight = np.concatenate((x[cur_piece].flatten(), model_weights[cur_piece]))
                 quantum_layers[cur_piece].set_weights([new_weight])
+
+            
             # ============================================= 
 
             @tf.function()
@@ -352,7 +380,8 @@ def main():
         # Test ---------------------------------------------
 
         ori_weights = [ql.get_weights()[0] for ql in quantum_layers]
-        model_weights = [ow[int(args.inputsize / 2) ** 2:] for ow in ori_weights]
+        model_weights = [ori_weights[i][piecesizes[i]:] for i in range(args.pieces)]
+        # model_weights = [ori_weights[0][]]
 
         ori_clf_weight = clf_layer.get_weights()[0]
         clf_weight =ori_clf_weight[args.pieces:]
@@ -399,7 +428,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-    save_path = './scale_qml/save_large/' + args.task
+    save_path = './scale_qml/save_differsize/' + args.task
     plot_performance(save_path, args.task)
     plot_var_grad(save_path, int((args.inputsize / 2) ** 2), args.pieces)
     
