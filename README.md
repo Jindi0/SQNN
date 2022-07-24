@@ -1,5 +1,5 @@
 # Scalable Quantum NN
-This repo is the code used to produce the results presented in "Scalable quantum neural network" (SQNN). 
+This repo is the code used to produce the results presented in "Scalable Quantum Neural Network" (SQNN). 
 
 ## Content
 - `main_qnn.py` builds and trains a regular QNN that follows the circuit structure design in [TensorFlow Quantum Tutorials](https://www.tensorflow.org/quantum/tutorials/mnist#14_encode_the_data_as_quantum_circuits), but uses different encoding method (angle encoding).
