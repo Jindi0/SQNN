@@ -3,3 +3,6 @@ save_large/*
 figures/*
 new_figures/*
 save_differsize/*
+results_analy_large.py
+results_analy_small.py
+save_local/*

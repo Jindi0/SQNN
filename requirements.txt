@@ -1,0 +1,9 @@
+tensorflow==2.7.0
+tensorflow-quantum
+cirq
+sympy
+scikit-learn
+numpy
+statistics
+xlwt
+collections

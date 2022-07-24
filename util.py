@@ -13,7 +13,13 @@ def dump_circuit(circuit: 'cirq.Circuit', dest_path=None):
 
 
 
-def init_log_cent(args):
+def init_log(args):
+    '''
+        The log file generator for QNN model
+        The file will record the training accuracy/loss in each training iteration,
+        the accuracy/loss on the validation/test dataset after each epoch,
+        and the hyperparameters.
+    '''
     f = xlwt.Workbook()
 
     sheet1 = f.add_sheet('results',cell_overwrite_ok=True)
@@ -36,5 +42,7 @@ def init_log_cent(args):
 
     sheet1.write(1, 0, 'Batch_size = ' + str(args.batchsize))
     sheet1.write(2, 0, 'Learning_rate = ' + str(args.lr))
+    sheet1.write(3, 0, 'Input_size = ' + str(args.inputsize))
 
     return f, sheet1
+

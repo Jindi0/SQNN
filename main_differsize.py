@@ -5,29 +5,21 @@ import cirq
 import sympy
 import tensorflow as tf
 import tensorflow_quantum as tfq
-# from sklearn.utils import shuffle
 import numpy as np
-import matplotlib.pyplot as plt
-from util import init_log_cent, dump_circuit
+from util import init_log, dump_circuit
 from data_helper import load_raw_data, split_train_validation, img_split_3piece
-# from callbackfunc import EvalModel_single, GetGradients
-from results_analy_large import plot_performance, plot_var_grad
 from sklearn.utils import shuffle
 
 
 def args_parser():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--task', type=str, default='differ_xyz_y_4bits', help='task name')
+    parser.add_argument('--task', type=str, default='sqnn_differsize', help='task name')
     parser.add_argument('--dataset', type=str, default='mnist', help="name of dataset")
     parser.add_argument('--seed', type=int, default=1, help='random seed')
     parser.add_argument('--inputsize', type=int, default=4, help='the input size is nxn')
-    parser.add_argument('--clfinputsize', type=int, default=3, help='the input size is nxn')
-    parser.add_argument('--pieces', type=int, default=3, help='the input size is nxn')
-    # parser.add_argument('--piece1size', type=int, default=8, help='the input size is nxn')
-    # parser.add_argument('--piece2size', type=int, default=4, help='the input size is nxn')
-    # parser.add_argument('--piece3size', type=int, default=4, help='the input size is nxn')
-    # parser.add_argument('--layers', type=int, default=2, help='the input size is nxn')
+    parser.add_argument('--clfinputsize', type=int, default=3, help='the input size of quantum predictor is n')
+    parser.add_argument('--pieces', type=int, default=3, help='the number of segments')
 
 
     parser.add_argument('--lr', type=float, default=0.1, help='learning rate')
@@ -61,8 +53,10 @@ class CircuitLayerBuilder():
 
 
 def create_clf_model(inputsize, piece_ind):
-
-    data_qubits = cirq.GridQubit.rect(1, inputsize)  # a 4x4 grid.
+    '''
+        Create the circuit of quantum predictor for classification
+    '''
+    data_qubits = cirq.GridQubit.rect(1, inputsize)  # a 1xinputsize grid.
     readout = cirq.GridQubit(-1, -1)         # a single qubit at [-1,-1]
     circuit = cirq.Circuit()
 
@@ -73,9 +67,10 @@ def create_clf_model(inputsize, piece_ind):
     builder = CircuitLayerBuilder(data_qubits = data_qubits,
                                     readout=readout)
 
-
-    # Then add layers (experiment by adding more).
+    # add input layer for angle encoding
     builder.add_input_layer(circuit, cirq.rx, "data{}".format(piece_ind))
+
+    # add variational quantum layer with Ising coupling gates
     # builder.add_layer(circuit, cirq.XX, "xx{}".format(piece_ind))
     builder.add_layer(circuit, cirq.YY, "yy{}".format(piece_ind))
     # builder.add_layer(circuit, cirq.YY, "zz{}".format(piece_ind))
@@ -87,8 +82,10 @@ def create_clf_model(inputsize, piece_ind):
 
 
 def create_quantum_model(piecesize, piece_ind):
-    """Create a QNN model circuit and readout operation to go along with it."""
-    data_qubits = cirq.GridQubit.rect(1, piecesize)  # a 4x4 grid.
+    '''
+        Create the circuit for quantum feature extractor
+    '''
+    data_qubits = cirq.GridQubit.rect(1, piecesize)  # a 1xpiecesize grid.
     readout = cirq.GridQubit(-1, -1)         # a single qubit at [-1,-1]
     circuit = cirq.Circuit()
 
@@ -100,8 +97,10 @@ def create_quantum_model(piecesize, piece_ind):
                                     readout=readout)
 
 
-    # Then add layers (experiment by adding more).
+    # add input layer for angle encoding
     builder.add_input_layer(circuit, cirq.rx, "data{}".format(piece_ind))
+
+    # add variational quantum layer with Ising coupling gates
     builder.add_layer(circuit, cirq.XX, "xx{}".format(piece_ind))
     builder.add_layer(circuit, cirq.YY, "yy{}".format(piece_ind))
     builder.add_layer(circuit, cirq.YY, "zz{}".format(piece_ind))
@@ -115,23 +114,85 @@ def shuffle_dataset(x, y):
     x0, x1, x2, y = shuffle(x[0], x[1], x[2], y)
     return [x0, x1, x2], y
 
+def evaluate_model(quantum_layers, clf_layer, piecesizes, eval_x, eval_y, epoch, phase, sheet, f, save_path):
+    input_qubits = tfq.convert_to_tensor([cirq.Circuit()])
+
+    ori_weights = [ql.get_weights()[0] for ql in quantum_layers]
+    model_weights = [ori_weights[i][piecesizes[i]:] for i in range(args.pieces)]
+
+    ori_clf_weight = clf_layer.get_weights()[0]
+    clf_weight =ori_clf_weight[args.pieces:]
+
+    correct_num = 0
+    loss = 0.0
+
+    for v in range(len(eval_y)):
+        x = [x_v[v] for x_v in eval_x]
+        y = eval_y[v]
+        y = 2.0 * y - 1.0
+
+        for cur_piece in range(args.pieces):
+            new_weight = np.concatenate((x[cur_piece].flatten(), model_weights[cur_piece]))
+            quantum_layers[cur_piece].set_weights([new_weight])
+
+        # ============================================= 
+        @tf.function()
+        def prediction():
+            # quantum layer
+            outs = []
+            for cur_piece in range(args.pieces):
+                out = quantum_layers[cur_piece](input_qubits)
+                outs.append(out)
+
+            # set clf parameters
+            outs2input = [o.numpy()[0][0] for o in outs]
+            outs2input = np.array(outs2input)
+
+            outs2input = np.pi * (outs2input + 1)
+
+            new_clf_weight = np.concatenate([outs2input, clf_weight])
+            clf_layer.set_weights([new_clf_weight])
+
+            final_out = clf_layer(input_qubits)
+
+            mse_loss = ((final_out - y) ** 2) / 2
+
+            return final_out, mse_loss
+        # ============================================= 
+        y_pred, mse_loss = prediction()
+        loss += mse_loss
+
+        if tf.math.sign(y_pred) == np.sign(y):
+            correct_num += 1
+
+    acc_eval = 100 * correct_num / len(eval_y)
+    loss_eval = loss / len(eval_y)
+
+    if phase == 'val':
+        sheet.write(int(epoch + 1), 5, acc_eval)
+        sheet.write(int(epoch + 1), 6, float(loss_eval.numpy()))
+        print('Epoch {}, Validation: Loss: {}, Accuracy: {}'.format(epoch, 
+                        loss_eval, acc_eval))
+    elif phase == 'test':
+        sheet.write(int(epoch + 1), 8, acc_eval)
+        sheet.write(int(epoch + 1), 9, float(loss_eval.numpy()))
+        print('Epoch {}, Test: Loss: {}, Accuracy: {}'.format(epoch, 
+                        loss_eval, acc_eval))
+    
+    f.save(save_path + '/{}.xls'.format(args.task))
 
 
 
 def main():
-    piecesizes = [8, 4, 4]
-    f, sheet = init_log_cent(args)
+    small_segment_size = int(args.inputsize / 2)**2
+    piecesizes = [small_segment_size * 2, small_segment_size, small_segment_size]
+    f, sheet = init_log(args)
+    if not os.path.exists('./scale_qml/save_differsize/'):
+        os.mkdir('./scale_qml/save_differsize/')
 
     save_path = './scale_qml/save_differsize/' + args.task
     if not os.path.exists(save_path):
         os.mkdir(save_path)
-
-    all_gradients_layer = []
-    all_gradients_clf = []
-    all_param_layer = []
-    all_param_clf = []
-    var_gradients_clf = []
-    var_gradients_layers = []
 
     x_train, y_train, x_test, y_test = load_raw_data(args)
     x_train, y_train, x_val, y_val = split_train_validation(x_train, y_train, args.validation_ratio)
@@ -158,9 +219,7 @@ def main():
     input_qubits = tfq.convert_to_tensor([cirq.Circuit()])
     
     optimizer = tf.keras.optimizers.SGD(lr=args.lr)
-    
-    
-    # --------------------------------------------------------------------
+
     tf.config.experimental_run_functions_eagerly(True)
 
     iterations = int(len(x_train_pieces[0]) / args.batchsize)
@@ -185,7 +244,6 @@ def main():
 
             ori_weights = [ql.get_weights()[0] for ql in quantum_layers]
             model_weights = [ori_weights[i][piecesizes[i]:] for i in range(args.pieces)]
-            # model_weights = [ori_weights[0][]]
 
             ori_clf_weight = clf_layer.get_weights()[0]
             clf_weight =ori_clf_weight[args.pieces:]
@@ -256,16 +314,6 @@ def main():
             print('Epoch {}, Iteration {}/{}: Loss: {}, Accuracy: {}'.format(epoch, 
                             iter, iterations, batchloss, acc))
 
-            # batch_gradients_pieces = tf.squeeze(tf.stack(batch_gradients_layer))
-            # batch_gradients_pieces = tf.transpose(batch_gradients_pieces, perm=[1, 0, 2])
-
-            # var_gradients_pieces = [tf.math.reduce_std(g, 0).numpy() for g in batch_gradients_pieces]
-            # var_gradients_layers.append(var_gradients_pieces)
-
-            # batch_gradients_clf_tmp = tf.squeeze(tf.stack(batch_gradients_clf))
-            # var_gradients_clf.append(tf.math.reduce_std(batch_gradients_clf_tmp, 0).numpy())
-
-
             batch_gradients_layer_1 = []
             batch_gradients_layer_2 = []
             batch_gradients_layer_3 = []
@@ -281,7 +329,6 @@ def main():
             batch_gradients_layer_3 = tf.squeeze(tf.math.reduce_mean(batch_gradients_layer_3, 0))
             batch_gradients_layer0 = [batch_gradients_layer_1, batch_gradients_layer_2, batch_gradients_layer_3]
 
-            # batch_gradients_layer0 = tf.squeeze(tf.math.reduce_mean(batch_gradients_layer, 0))
             batch_gradients_clf0 = tf.math.reduce_mean(batch_gradients_clf, 0)
 
             optimizer.apply_gradients(zip(batch_gradients_clf0, clf_layer.trainable_variables))
@@ -289,146 +336,20 @@ def main():
                 tmp = [batch_gradients_layer0[cur]]
                 tmp1 = quantum_layers[cur].trainable_variables
                 optimizer.apply_gradients(zip(tmp, tmp1))
-            
-
-            all_gradients_layer.append(batch_gradients_layer0)
-            all_gradients_clf.append(batch_gradients_clf0.numpy())
-            all_param_layer.append([ql.get_weights()[0][:int(args.inputsize / 2) ** 2] for ql in quantum_layers])
-            all_param_clf.append(clf_layer.trainable_variables[0].numpy())
-
-            np.save(save_path + '/gradients_layer.npy', np.array(all_gradients_layer))
-            np.save(save_path + '/gradients_clf.npy', np.array(all_gradients_clf))
-            np.save(save_path + '/all_models_layer.npy', np.array(all_param_layer))
-            np.save(save_path + '/all_models_clf.npy', np.array(all_param_clf))
-            np.save(save_path + '/var_gradients_layer.npy', np.array(var_gradients_layers))
-            np.save(save_path + '/var_gradients_clf.npy', np.array(var_gradients_clf))
 
             sheet.write(int(epoch * int(iterations) + iter + 1), 2, acc)
             sheet.write(int(epoch * int(iterations) + iter + 1), 3, float(batchloss.numpy()))
             f.save(save_path + '/{}.xls'.format(args.task))
                 
-        # validation ---------------------------------------------
+        # ----------- Evaluation -------------------------------------------
+        evaluate_model(quantum_layers, clf_layer, piecesizes, x_val_pieces, y_val, epoch, 'val', sheet, f, save_path)
+        evaluate_model(quantum_layers, clf_layer, piecesizes, x_test_pieces, y_test, epoch, 'test', sheet, f, save_path)
+        
         
 
-        # ori_weights = [ql.get_weights()[0] for ql in quantum_layers]
-        # model_weights = [ow[int(args.inputsize / 2) ** 2:] for ow in ori_weights]
-
-        ori_weights = [ql.get_weights()[0] for ql in quantum_layers]
-        model_weights = [ori_weights[i][piecesizes[i]:] for i in range(args.pieces)]
-        # model_weights = [ori_weights[0][]]
-
-        ori_clf_weight = clf_layer.get_weights()[0]
-        clf_weight =ori_clf_weight[args.pieces:]
-
-        correct_val = 0
-        loss_val = 0.0
-
-        for v in range(len(y_val)):
-            x = [x_v[v] for x_v in x_val_pieces]
-            y = y_val[v]
-            y = 2.0 * y - 1.0
-
-            for cur_piece in range(args.pieces):
-                new_weight = np.concatenate((x[cur_piece].flatten(), model_weights[cur_piece]))
-                quantum_layers[cur_piece].set_weights([new_weight])
-
-            
-            # ============================================= 
-
-            @tf.function()
-            def prediction():
-                # quantum layer
-                outs = []
-                for cur_piece in range(args.pieces):
-                    out = quantum_layers[cur_piece](input_qubits)
-                    outs.append(out)
-
-                # set clf parameters
-                outs2input = [o.numpy()[0][0] for o in outs]
-                outs2input = np.array(outs2input)
-
-                outs2input = np.pi * (outs2input + 1)
-
-                new_clf_weight = np.concatenate([outs2input, clf_weight])
-                clf_layer.set_weights([new_clf_weight])
-
-                final_out = clf_layer(input_qubits)
-
-                mse_loss = ((final_out - y) ** 2) / 2
-
-                return final_out, mse_loss
-            # ============================================= 
-
-            y_pred, mse_loss = prediction()
-            
-            loss_val += mse_loss
-
-            if tf.math.sign(y_pred) == np.sign(y):
-                correct_val += 1
-
-        acc_val = 100 * correct_val / len(y_val)
-        loss_val = loss_val / len(y_val)
         
-        print('Epoch {}, Validation: Loss: {}, Accuracy: {}'.format(epoch, 
-                            loss_val, acc_val))
-
-        sheet.write(int(epoch + 1), 5, acc_val)
-        sheet.write(int(epoch + 1), 6, float(loss_val.numpy()))
-        f.save(save_path + '/{}.xls'.format(args.task))
-
-    
-        # Test ---------------------------------------------
-
-        ori_weights = [ql.get_weights()[0] for ql in quantum_layers]
-        model_weights = [ori_weights[i][piecesizes[i]:] for i in range(args.pieces)]
-        # model_weights = [ori_weights[0][]]
-
-        ori_clf_weight = clf_layer.get_weights()[0]
-        clf_weight =ori_clf_weight[args.pieces:]
-
-        correct_test = 0
-        loss_test = 0.0
-
-        for v in range(len(y_test)):
-            x = [x_v[v] for x_v in x_test_pieces]
-            y = y_test[v]
-            y = 2.0 * y - 1.0
-
-            for cur_piece in range(args.pieces):
-                new_weight = np.concatenate((x[cur_piece].flatten(), model_weights[cur_piece]))
-                quantum_layers[cur_piece].set_weights([new_weight])
-
-            y_pred, mse_loss = prediction()
-            # loss_val += loss
-
-            loss_test += mse_loss
-
-            if tf.math.sign(y_pred) == np.sign(y):
-                correct_test += 1
-
-        acc_test = 100 * correct_test / len(y_test)
-        loss_test = loss_test / len(y_test)
-        
-        print('Epoch {}, Testing: Loss: {}, Accuracy: {}'.format(epoch, 
-                            loss_test, acc_test))
-
-        sheet.write(int(epoch + 1), 8, acc_test)
-        sheet.write(int(epoch + 1), 9, float(loss_test.numpy()))
-        f.save(save_path + '/{}.xls'.format(args.task))
-
-        
-
-            
-
-
-            
-    
-
-
+   
 
 if __name__ == "__main__":
     main()
-    save_path = './scale_qml/save_differsize/' + args.task
-    plot_performance(save_path, args.task)
-    plot_var_grad(save_path, int((args.inputsize / 2) ** 2), args.pieces)
     
