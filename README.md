@@ -48,7 +48,7 @@ If there is any question, please send emails to [jwu21@wm.edu](jwu21@wm.edu).
 ## Citation
 If you use this code in your work, please cite our paper.
 ```
-@inproceedings{wu2022wpscalable,
+    @inproceedings{wu2022wpscalable,
   title={wpScalable Quantum Neural Networks for Classification},
   author={Wu, Jindi and Tao, Zeyi and Li, Qun},
   booktitle={2022 IEEE International Conference on Quantum Computing and Engineering (QCE)},
@@ -57,3 +57,4 @@ If you use this code in your work, please cite our paper.
   organization={IEEE}
 }
 ```
+
